@@ -49,12 +49,12 @@ rdrr extracts source content without an LLM summarization step.
 
 Example sizes, measured with rdrr 0.7.0 on September 11, 2026:
 
-| Page                                                                           | Raw HTML | Markdown body | Reduction |
-| ------------------------------------------------------------------------------ | -------: | ------------: | --------: |
-| [React quick start](https://react.dev/learn)                                   |   66,256 |         3,785 |     17.5x |
+| Page                                                                                                          | Raw HTML | Markdown body | Reduction |
+| ------------------------------------------------------------------------------------------------------------- | -------: | ------------: | --------: |
+| [React quick start](https://react.dev/learn)                                                                  |   66,256 |         3,785 |     17.5x |
 | [MDN Array.map()](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/map) |   44,578 |         2,654 |     16.8x |
-| [TypeScript on Wikipedia](https://en.wikipedia.org/wiki/TypeScript)            |  107,137 |        10,171 |     10.5x |
-| [Dropbox discussion on Hacker News](https://news.ycombinator.com/item?id=8863) |   25,250 |         7,967 |      3.2x |
+| [TypeScript on Wikipedia](https://en.wikipedia.org/wiki/TypeScript)                                           |  107,137 |        10,171 |     10.5x |
+| [Dropbox discussion on Hacker News](https://news.ycombinator.com/item?id=8863)                                |   25,250 |         7,967 |      3.2x |
 
 Counts are **estimated tokens**, using `ceil(text.length / 4)`, with no truncation. Savings depend on the page and tokenizer. [Measurement method](./docs/reference.md#token-measurements).
 
@@ -83,7 +83,7 @@ Try another source with the same command:
 | GitHub                     | `rdrr "https://github.com/mozilla/readability/issues/1"` | Issue body and comments; also supports PR conversations, discussions, and files |
 | Stack Overflow             | `rdrr "https://stackoverflow.com/questions/11227809"`    | Question and up to 10 top-voted answers                                         |
 | npm                        | `rdrr "https://www.npmjs.com/package/rdrr"`              | Package facts and README from the registry                                      |
-| Reddit                     | `rdrr "https://www.reddit.com/comments/1wd9yit/"`        | Public post body and available comments from Reddit's RSS feed                   |
+| Reddit                     | `rdrr "https://www.reddit.com/comments/1wd9yit/"`        | Public post body and available comments from Reddit's RSS feed                  |
 | X / Twitter                | `rdrr "https://x.com/discotune" -n 10`                   | Recent public posts; single post URLs work too                                  |
 | Local HTML                 | `rdrr page.html` or `cat page.html \| rdrr -`            | Markdown from a saved file or HTML stream                                       |
 
@@ -146,6 +146,7 @@ If content is truncated and you need the rest, rerun without `--budget`.
 | Get metadata and a quality score | `rdrr "https://react.dev/learn" --format json --quality` |
 | Print only the Markdown body     | `rdrr "https://react.dev/learn" --property content`      |
 | Append the site's llms.txt       | `rdrr "https://svelte.dev/docs/svelte/overview" --llms`  |
+| Process a manifest of URLs       | `rdrr batch urls.txt --out-dir ./out --concurrency 8`    |
 | Inspect recent failures          | `rdrr history --failures`                                |
 
 Output formats: Markdown with YAML frontmatter (default), JSON, JSONL, and XML. `--budget` uses an estimate of four characters per token and preserves paragraphs and fenced code blocks, so it can exceed the requested size. Metadata is extra.
@@ -183,6 +184,19 @@ console.log(page.content)
 ```
 
 The package uses ESM and bundles its runtime dependencies. [Library options and exports](./docs/reference.md#library).
+
+For bulk collection, `runBatch` takes a parsed manifest and writes one result file per URL plus append-only `results.jsonl`/`progress.jsonl` logs into an output directory, resuming across runs:
+
+```ts
+import { parseManifest, runBatch } from "rdrr"
+
+const { entries, duplicates } = parseManifest(manifestText)
+const { summary } = await runBatch("./out", entries, duplicates, {
+  concurrency: 8,
+  history: false,
+  log: (line) => console.error(line),
+})
+```
 
 ## Know the limits
 

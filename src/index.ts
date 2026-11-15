@@ -1,4 +1,8 @@
 export { parse } from "./rdrr"
+export { parseManifest, runBatch, DEFAULT_CONCURRENCY, MAX_CONCURRENCY } from "./batch/index"
+export type { RunBatchOptions, RunBatchResult } from "./batch/options"
+export type { BatchRecord, BatchStatus, BatchSummary, BatchEntry } from "./batch/types"
+export { resolveSiteKey } from "./detect"
 export { parseHtml, parseWeb, type ParseHtmlOptions } from "./provider/web"
 export { parseYouTube } from "./provider/youtube"
 export { parseGitHub } from "./provider/github"

@@ -27,6 +27,8 @@ Supports: webpages, YouTube transcripts, GitHub issues/PRs/discussions/files, St
 | `src/extract/filters/`  | Content filtering (hidden, scoring, patterns)               |
 | `src/extract/utils/`    | DOM helpers                                                 |
 | `src/provider/`         | Domain: Content providers (web, youtube, github, stackoverflow, npm, x)       |
+| `src/batch/`            | Domain: manifest batch runs (scheduler, append-only store, resume, summary)   |
+| `src/cli/`              | CLI-only helpers (budget, format, history, quality, shared per-URL pipeline)  |
 
 ## Common commands
 

@@ -199,6 +199,20 @@ export const normalizeUrl = (url: string): string => {
   }
 }
 
+/**
+ * Single source of truth for "which site does this URL belong to". Both the
+ * single-URL path and batch scheduling derive site ownership from here so the
+ * batch layer never re-implements hostname rules. Lowercased hostname; an
+ * unparseable URL yields "" (callers validate URLs before scheduling).
+ */
+export const resolveSiteKey = (url: string): string => {
+  try {
+    return new URL(url).hostname.toLowerCase()
+  } catch {
+    return ""
+  }
+}
+
 export const extractVideoId = (url: string): string | null => {
   try {
     const u = new URL(url)

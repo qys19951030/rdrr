@@ -6,11 +6,12 @@ import { createReadStream, existsSync, writeFileSync } from "node:fs"
 import { resolve as resolvePath } from "node:path"
 import { pathToFileURL } from "node:url"
 import type { ParseResult } from "./types"
-import { estimateTokens, truncateToBudget } from "./cli/budget"
+import { DEFAULT_CONCURRENCY, MAX_CONCURRENCY, ManifestError, parseManifest, runBatch } from "./batch/index"
+import { estimateTokens } from "./cli/budget"
 import { copyToClipboard } from "./cli/clipboard"
-import { parseFormat, renderJsonl, renderXml, type EnrichedResult, type OutputFormat } from "./cli/format"
+import { parseFormat, type EnrichedResult, type OutputFormat } from "./cli/format"
 import { filterHistory, readHistory, recordHistory, sanitiseArgs, sanitiseUrl } from "./cli/history"
-import { computeQuality } from "./cli/quality"
+import { enrichResult, renderOutput } from "./cli/pipeline"
 import { detectUrlType } from "./detect"
 import { isProbablyReaderable } from "./extract/readerable"
 import { parseHtml } from "./provider/web"
@@ -47,36 +48,6 @@ const resolveInput = async (input: string): Promise<ResolvedInput> => {
   }
 
   return { kind: "url", url: ensureProtocol(input), raw: input }
-}
-
-// YAML double-quoted strings accept the JSON string grammar, so JSON.stringify
-// produces a valid-and-readable value and correctly escapes backslashes, quotes,
-// and control characters that the previous hand-rolled escaper missed.
-const yamlString = (value: string): string => JSON.stringify(value.replace(/\n/g, " "))
-
-const buildFrontmatter = (result: ParseResult, source: string): string => {
-  const fields: Array<[string, unknown]> = [
-    ["title", result.title],
-    ["author", result.author],
-    ["site", result.siteName],
-    ["published", result.published],
-    ["source", source],
-    ["next_page", result.nextPageUrl],
-    ["domain", result.domain],
-    ["language", result.language],
-    ["dir", result.dir],
-    ["description", result.description],
-    ["word_count", result.wordCount],
-    // Explicit signal for agents: a frontmatter-only document is a failed
-    // extraction, not a page with no content.
-    ["extraction", result.content.trim() === "" ? "empty" : undefined],
-  ]
-
-  const lines = fields
-    .filter(([, value]) => value !== undefined && value !== null && value !== "")
-    .map(([key, value]) => `${key}: ${typeof value === "string" ? yamlString(value) : value}`)
-
-  return lines.length > 0 ? `---\n${lines.join("\n")}\n---\n\n` : ""
 }
 
 const createDebug =
@@ -203,11 +174,8 @@ program
           contentChars: result.content.length,
         })
 
-        const extracted: EnrichedResult = result.content.trim() ? result : { ...result, extractionEmpty: true }
-        const budgeted = opts.budget ? applyBudget(extracted, opts.budget) : extracted
-        if (opts.budget) debug("budget", { budget: opts.budget, contentChars: budgeted.content.length })
-
-        const scored: EnrichedResult = opts.quality ? { ...budgeted, quality: computeQuality(budgeted) } : budgeted
+        const scored: EnrichedResult = enrichResult(result, opts)
+        if (opts.budget) debug("budget", { budget: opts.budget, contentChars: scored.content.length })
         if (scored.quality) debug("quality", scored.quality)
 
         const output = formatOutput(scored, source, opts)
@@ -319,47 +287,20 @@ const runPipeline = async (
   return parseHtml(resolved.html!, { url: resolved.url, language: opts.language, wordsPerMinute: opts.wpm })
 }
 
-const applyBudget = (result: EnrichedResult, budget: number): EnrichedResult => {
-  const { content, info } = truncateToBudget(result.content, budget)
-  if (!info) return result
-  // Attach `truncated` as an extra field so JSON output carries it; frontmatter/
-  // markdown modes get the inline `[truncated ...]` marker that `content` already includes.
-  return { ...result, content, truncated: info }
-}
-
-const pickProperty = (result: ParseResult, property: string): unknown => {
-  // `ParseResult` variants (YouTube, GitHub, XProfile) each add their own
-  // fields. Route through a discriminated index instead of a blanket cast so
-  // future additions surface via the type system.
-  const record: Record<string, unknown> = { ...result }
-  return Object.hasOwn(record, property) ? record[property] : undefined
-}
-
 const formatOutput = (
   result: EnrichedResult,
   source: string,
   opts: { json?: boolean; format?: OutputFormat; property?: string },
 ): string => {
-  if (opts.property) {
-    const value = pickProperty(result, opts.property)
-    if (value === undefined) {
-      process.stderr.write(`Property "${opts.property}" not found\n`)
-      process.exit(1)
-    }
-    return typeof value === "string" ? value : JSON.stringify(value, null, 2)
-  }
-
   const format = resolveFormat(opts)
-  switch (format) {
-    case "json":
-      return JSON.stringify(result, null, 2)
-    case "jsonl":
-      return renderJsonl(result)
-    case "xml":
-      return renderXml(result, { source, fetchedAt: new Date().toISOString() })
-    case "md":
-    default:
-      return buildFrontmatter(result, source) + result.content
+  // renderOutput only throws for unknown --property values; keep the exact
+  // stderr wording the single-URL CLI always produced.
+  try {
+    return renderOutput(result, source, { format, property: opts.property }, new Date().toISOString())
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`${message}\n`)
+    process.exit(1)
   }
 }
 
@@ -443,6 +384,111 @@ program
     }
     if (opts.json) process.stdout.write(JSON.stringify(latest, null, 2) + "\n")
     else process.stdout.write(latest.url + "\n")
+  })
+
+interface BatchCliOptions {
+  outDir: string
+  concurrency?: number
+  format?: OutputFormat
+  property?: string
+  language?: string
+  llms?: boolean
+  limit?: number
+  order?: "newest" | "oldest"
+  timeout?: number
+  userAgent?: string
+  githubToken?: string
+  wpm?: number
+  budget?: number
+  quality?: boolean
+  history?: boolean
+  allowPrivateNetworks?: boolean
+  strict?: boolean
+}
+
+const parseConcurrencyArg = (value: string): number => {
+  const parsed = parseLimitArg(value)
+  if (parsed > MAX_CONCURRENCY) {
+    throw new InvalidArgumentError(`must be at most ${MAX_CONCURRENCY}`)
+  }
+  return parsed
+}
+
+const logStderr = (message: string): void => {
+  process.stderr.write(`${message}\n`)
+}
+
+program
+  .command("batch <manifest>")
+  .description("process a manifest of URLs (file path, or - for stdin; one URL per line, # comments allowed)")
+  .requiredOption("--out-dir <dir>", "directory for per-result files, results.jsonl and progress.jsonl")
+  .option(
+    `--concurrency <n>`,
+    `max parallel fetches across sites, 1-${MAX_CONCURRENCY} (default ${DEFAULT_CONCURRENCY})`,
+    parseConcurrencyArg,
+  )
+  .option("--format <fmt>", "output format per entry: md | json | jsonl | xml", parseFormatArg)
+  .option("-p, --property <name>", "extract specific field (title, author, etc.)")
+  .option("-l, --language <code>", "preferred language (BCP 47)")
+  .option("-n, --limit <n>", "for aggregate URLs: max items to fetch", parseLimitArg)
+  .option("--order <order>", "for aggregate URLs: newest|oldest", parseOrderArg, "newest")
+  .option("--llms", "append the site's /llms.txt to the output if available")
+  .option("--timeout <ms>", "timeout in milliseconds per request (default 25000)", parseLimitArg)
+  .option("--user-agent <ua>", "override the outbound User-Agent header")
+  .option("--github-token <token>", "GitHub API token (falls back to $GITHUB_TOKEN)")
+  .option("--wpm <n>", "words-per-minute used for readTime estimation (default 200)", parseLimitArg)
+  .option("--budget <tokens>", "truncate each output to fit a token budget", parseLimitArg)
+  .option("--quality", "include a quality/readability report (score 0-100) in JSON output")
+  .option("--no-history", "skip logging every call to ~/.local/state/rdrr/history.jsonl")
+  .option("--allow-private-networks", "allow fetches against RFC1918/loopback/link-local (SSRF-unsafe)")
+  .option("--strict", "exit 3 when any entry extracts no content")
+  .action(async function (this: CommandSelf, manifest: string, opts: BatchCliOptions) {
+    const all = { ...opts, ...this.optsWithGlobals() } as BatchCliOptions
+    try {
+      const text =
+        manifest === "-"
+          ? await readStreamText(process.stdin)
+          : await readStreamText(createReadStream(resolvePath(manifest)))
+      const { entries, duplicates } = parseManifest(text)
+
+      const controller = new AbortController()
+      const stop = (): void => controller.abort(new Error("interrupted"))
+      process.once("SIGINT", stop)
+      process.once("SIGTERM", stop)
+
+      const { hasEmpty, hasFailure } = await runBatch(all.outDir, entries, duplicates, {
+        concurrency: all.concurrency ?? DEFAULT_CONCURRENCY,
+        format: all.format,
+        property: all.property,
+        language: all.language,
+        llms: all.llms,
+        limit: all.limit,
+        order: all.order,
+        timeout: all.timeout,
+        userAgent: all.userAgent,
+        githubToken: all.githubToken,
+        wpm: all.wpm,
+        budget: all.budget,
+        quality: all.quality,
+        history: all.history !== false,
+        allowPrivateNetworks: all.allowPrivateNetworks,
+        signal: controller.signal,
+        log: logStderr,
+      })
+
+      // Mirrors single-URL semantics: hard failures are exit 1; --strict turns
+      // any empty extraction (including an all-empty batch) into exit 3.
+      if (hasFailure) process.exit(1)
+      if (hasEmpty && all.strict) process.exit(3)
+    } catch (error) {
+      if (error instanceof ManifestError) {
+        process.stderr.write(`Error: ${error.message}\n`)
+        process.exit(2)
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      process.stderr.write(`Error: ${message}\n`)
+      process.exit(1)
+    }
   })
 
 program.parse()

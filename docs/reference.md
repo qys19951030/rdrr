@@ -38,19 +38,43 @@ rdrr <input> [options]
 ```sh
 rdrr history [--limit 20] [--search react] [--since 2026-04-01] [--failures] [--json]
 rdrr last [--json]
+rdrr batch <manifest> --out-dir <dir> [options]
 ```
 
 History lives at `$XDG_STATE_HOME/rdrr/history.jsonl` (falls back to `~/.local/state/rdrr/history.jsonl`), rotates at 1000 entries, and strips credentials from URLs and sensitive flag values before writing. Disable globally with `RDRR_NO_HISTORY=1`.
 
+### Batch mode
+
+```sh
+rdrr batch urls.txt --out-dir ./out --concurrency 8 --format json
+cat urls.txt | rdrr batch - --out-dir ./out
+```
+
+The manifest is a file path or `-` for stdin, with one address per line. Blank lines and lines starting with `#` are ignored; a URL without a scheme gets `https://`. Repeated addresses are processed once and counted separately as duplicates. A manifest with no usable URLs fails with exit code 2 rather than succeeding silently.
+
+Output is always written under `--out-dir` (created if needed):
+
+| Path                 | Contents                                                                            |
+| -------------------- | ----------------------------------------------------------------------------------- |
+| `files/<hash>.<ext>` | One rendered result file per URL, never overwritten                                 |
+| `results.jsonl`      | One JSON record per attempt: URL, site, status, duration, fetched time, output file |
+| `progress.jsonl`     | Completion markers, always appended **after** the corresponding result record       |
+
+Both logs are append-only newline-delimited JSON, so a killed process leaves every flushed line complete and parseable. `results.jsonl` is the authority on resume: entries whose latest record is `success` (including `--budget`-shortened results) are skipped, while `empty` and `failed` entries are reprocessed. If `progress.jsonl` is missing or behind, it is rebuilt from `results.jsonl` — the two logs never disagree about what is complete.
+
+Concurrency is bounded two ways: `--concurrency <n>` (default 4, hard cap 16) limits total in-flight fetches, and tasks for the same hostname never overlap — each site gets its own serial queue, so one slow site cannot stall other sites. All single-URL flags apply per entry: `--format`, `--budget`, `--quality`, `-l/--language`, `--llms`, `--timeout`, `--user-agent`, `--github-token`, `--wpm`, `--allow-private-networks`, and `--no-history` (which disables history for the whole batch).
+
+Per-entry `Empty:` and `Failed:` lines and the final summary (totals for success/empty/failed/skipped/duplicates, site count, and per-site task counts with average duration) go to **stderr**; stdout stays empty so scripts can rely on it. Exit codes: `0` when every entry completed (empty extractions included), `1` when at least one entry failed, and `3` with `--strict` when any entry — including an all-empty batch — extracted nothing.
+
 ### Exit codes
 
-| Code | Meaning                                                                     |
-| ---- | --------------------------------------------------------------------------- |
-| `0`  | Success, including an empty extraction without `--strict`                   |
-| `1`  | Fetch/parse error, invalid numeric option, unreadable URL, missing property |
-| `2`  | Invalid usage (`--check` on a non-URL, bad `--since` date)                  |
-| `3`  | Empty extraction with `--strict`                                            |
-| `5`  | Clipboard copy failed                                                       |
+| Code | Meaning                                                                                                       |
+| ---- | ------------------------------------------------------------------------------------------------------------- |
+| `0`  | Success, including an empty extraction without `--strict`                                                     |
+| `1`  | Fetch/parse error, invalid numeric option, unreadable URL, missing property; also any batch entry that failed |
+| `2`  | Invalid usage (`--check` on a non-URL, bad `--since` date, empty/invalid batch manifest)                      |
+| `3`  | Empty extraction with `--strict` (single URL, or any batch entry)                                             |
+| `5`  | Clipboard copy failed                                                                                         |
 
 ### Output formats
 
